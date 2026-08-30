@@ -4,47 +4,70 @@ metadata:
   name: lite-scaler-config
 data:
   config.yaml: |
-    # NOT READY TO RUN FOR REAL. worker-prod is still an auto_scale group, owned
-    # by the Yandex cluster-autoscaler. This scaler only understands fixed_scale
-    # (app/yc.py reads scale_policy.fixed_scale.size), so against an auto_scale
-    # group it reads the size as 0 and its stability gate blocks every decision —
-    # it would run as a silent no-op. Converting worker-prod means recreating it,
-    # which is a production outage, so that is a separate, planned change.
-    # Until then dry_run stays true.
+    # Live on prod since 2026-08-31.
+    #
+    # The old blocker at the top of this file is gone. It said worker-prod was
+    # an auto_scale group owned by the Yandex cluster-autoscaler, that this
+    # scaler only understands fixed_scale, and that converting the group meant
+    # recreating it. All true - and Terraform confirmed the hard part: the
+    # scaling type and node_taints are replacement attributes, so switching the
+    # live group would have destroyed every burst node at once.
+    #
+    # So the group was not converted. A second one was created next to it
+    # (k8s-terraform: yandex_kubernetes_node_group.external_scaled
+    # ["worker-prod-burst"]), fixed_scale from birth, and this scaler owns its
+    # size. Both groups carry workload=general-prod, so worker pods schedule
+    # onto either; the old one is drained and removed once this one carries the
+    # load.
     yandex_cloud:
       service_account_key_file: /secrets/sa-key.json
-      node_group_id: cat8gsfad91brpidohkl
+      # k8s-nodes-central1-a-prod-burst. NOT cat8gsfad91brpidohkl - that is the
+      # old auto_scale worker-prod, which this scaler must never touch.
+      node_group_id: cato54ig3tc5bgct3vvp
       cluster_id: catp68de0kgi9fc22v0c
       master_endpoint: internal
 
     kubernetes:
       namespace: bot-prod
       label_selectors:
-        # Pods of the KEDA ScaledJob `bot-prod-general` (min 1 / max 500).
+        # Pods of the KEDA ScaledJob `bot-prod-general` - one Job per meeting,
+        # plus the warm pool (35 workers 04:00-21:00 MSK on weekdays, 5
+        # otherwise; BotsService `idleSchedule`).
         - app=bot-prod-worker
 
     scaling:
       pending_pod_threshold: 0
       headroom: 0.10
-      max_size: 45                      # worker-prod ceiling
-      # Capacity accounting caveat: the scaler only measures nodes labelled
+      max_size: 45
+      # Capacity accounting caveat, unchanged from when this file was written:
+      # the scaler only measures nodes labelled
       # yandex.cloud/node-group-id=<node_group_id>, but bot-prod pods select on
-      # workload=general-prod, which ALSO matches worker-prod-reserve (a separate
-      # group, 3 warm nodes). Free capacity on the reserve pool is therefore
-      # invisible here and the scaler can add nodes the reserve would have
-      # absorbed. Validate against real load before trusting scale-up sizing.
-      min_size: 1
+      # workload=general-prod, which ALSO matches worker-prod-reserve. Free
+      # capacity on the reserve is therefore invisible here and the scaler can
+      # add a node the reserve would have absorbed. The reserve is one node now
+      # (15 worker slots) and runs full through the peak, so the overlap is
+      # small - but it is the first thing to check if scale-up looks eager.
+      #
+      # min_size 2, not 1, for the first days: the pool jumps from 5 to 35 at
+      # 04:00 MSK, the reserve covers 15 of that, and the remaining 20 need two
+      # nodes. Drop to 1 once scale-up has been seen keeping up.
+      #
+      # Note what min_size does and does not do. It is a FLOOR for scale-down
+      # (app/scaling.py: target = max(current_size - empty, min_size)); the
+      # scaler never grows a group to reach it, because scale-up is driven only
+      # by Pending pods. So setting min_size does not pre-provision anything -
+      # the group was resized to 2 out of band once, and min_size is what stops
+      # it shrinking back overnight.
+      min_size: 2
       scale_down_cooldown_polls: 3
       poll_interval_seconds: 30
-      dry_run: true                     # see the blocker at the top of this file
+      # Live, not a dry run: prod capacity has to actually follow the load.
+      dry_run: false
       log_level: INFO
-      node_capacity_fallback:           # matches worker-prod: highfreq-v3 32 vCPU / 64 GiB
+      node_capacity_fallback:           # matches worker-prod-burst: highfreq-v3 32 vCPU / 64 GiB
         cpu: 32
         memory_gib: 64
 
-    # Added upstream in 6f6c222. Stated explicitly rather than left to the
-    # MetricsConfig() default, because this patch replaces the whole config.yaml
-    # string — an omitted block here is invisible, not inherited from base.
     metrics:
       enabled: true
       port: 9090

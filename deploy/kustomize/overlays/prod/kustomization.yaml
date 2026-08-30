@@ -6,6 +6,17 @@ namespace: kube-system
 resources:
   - ../../base
 
+# The dev instance already occupies the base names in this namespace. Without
+# a distinct name AND a distinct app label, applying this overlay would not add
+# a second scaler - it would overwrite the dev one, and the two Deployments
+# would fight over the same pods through an identical selector.
+nameSuffix: -prod
+
+labels:
+  - pairs:
+      app: lite-scaler-prod
+    includeSelectors: true
+
 patches:
   - path: config-patch.yaml
     target:
@@ -15,4 +26,7 @@ patches:
 
 images:
   - name: cr.yandex/crpcvsde88m85as3hdu0/lite-scaler
-    newTag: latest   # prod: pin to an immutable tag (e.g. a git SHA) before real use
+    # The build dev has been running since 2026-08-20. Prod pins an immutable
+    # tag on purpose: a rolling restart must bring back the build that was
+    # watched, not whatever was pushed to :latest since.
+    newTag: "96d3218"
