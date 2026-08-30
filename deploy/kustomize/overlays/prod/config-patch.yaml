@@ -48,17 +48,29 @@ data:
       # (15 worker slots) and runs full through the peak, so the overlap is
       # small - but it is the first thing to check if scale-up looks eager.
       #
-      # min_size 2, not 1, for the first days: the pool jumps from 5 to 35 at
-      # 04:00 MSK, the reserve covers 15 of that, and the remaining 20 need two
-      # nodes. Drop to 1 once scale-up has been seen keeping up.
+      # min_size 1, and the number is load-bearing: with worker-prod-reserve
+      # fixed at one node (15 worker slots) this is what the cluster costs when
+      # nothing is happening.
       #
-      # Note what min_size does and does not do. It is a FLOOR for scale-down
-      # (app/scaling.py: target = max(current_size - empty, min_size)); the
-      # scaler never grows a group to reach it, because scale-up is driven only
-      # by Pending pods. So setting min_size does not pre-provision anything -
-      # the group was resized to 2 out of band once, and min_size is what stops
-      # it shrinking back overnight.
-      min_size: 2
+      # 2 was wrong. A pool of 35 needs three nodes and a pool of 5 needs one,
+      # so a floor of 1 reserve + 2 burst is three nodes around the clock - the
+      # same three the peak needs. The schedule would have dropped the pool
+      # every night and saved nothing.
+      #
+      # 0 is wrong too, in the other direction. Measured over the 14 days to
+      # 2026-08-31, the off-peak queue runs p99 21 on weeknights and 18 at
+      # weekends, so 5 + 21 = 26 slots are wanted at the 99th percentile and the
+      # reserve alone offers 15. On 0 those spikes would wait out a scale-up:
+      # ~40s to decide, ~2 min for the node, ~2 more before the device plugin
+      # advertises squat.ai/video - five minutes before a meeting gets a bot.
+      #
+      # 1 covers p99 (26 of 30 slots) and only the outlier night - the 14-day
+      # max was 36 queued - reaches for a third node.
+      #
+      # What min_size does NOT do: grow the group. It is a floor for scale-down
+      # only (app/scaling.py: target = max(current_size - empty, min_size));
+      # scale-up is driven purely by Pending pods.
+      min_size: 1
       scale_down_cooldown_polls: 3
       poll_interval_seconds: 30
       # Live, not a dry run: prod capacity has to actually follow the load.
