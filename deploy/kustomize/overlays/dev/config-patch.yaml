@@ -22,20 +22,27 @@ data:
     scaling:
       pending_pod_threshold: 0
       headroom: 0.10
-      # 6 -> 20 -> 30, both on 2026-08-19. The 6 was inherited from the old
+      # 6 -> 20 -> 30 on 2026-08-19, raised again to 100 in-cluster during the
+      # packing tests, now settled at 10. The 6 was inherited from the old
       # auto_scale group and turned out to be the binding limit: real dev load
       # left 27 pods queued (one waited 170 min) while the scaler asked for 15
-      # nodes. At 20 the first ramp peaked at 16, leaving little room to test
-      # with, hence 30. Nothing in the cloud enforces a ceiling here - the group
-      # is fixed_scale, and folder quotas cover ~89 more nodes of this size - so
-      # this number is purely a cost guard. prod's group carries 45.
-      max_size: 30
-      # min_size 3, NOT 0: scale-down counts a node "empty" when it carries no pod
-      # matching the selectors above, but worker-dev nodes also host bot-dev-main,
-      # calendar-dev-app and scheduler-dev-app. Yandex picks which node to drain,
-      # so a lower floor could evict those. Keep the floor at the steady-state
-      # node count until scale-down has been observed behaving.
-      min_size: 3
+      # nodes. The 30 and the uncommitted 100 were headroom for those tests and
+      # outlived their purpose. Nothing in the cloud enforces a ceiling here -
+      # the group is fixed_scale, and folder quotas cover ~89 more nodes of this
+      # size - so this number is purely a cost guard, and 10 nodes (162 RUB/h) is
+      # as much dev is ever expected to need. prod's group carries 45.
+      max_size: 10
+      # 3 -> 1 on 2026-08-30. The floor of 3 was a precaution: scale-down counts
+      # a node "empty" when it carries no pod matching the selectors above, but
+      # worker-dev nodes also host bot-dev-main, calendar-dev-app and
+      # scheduler-dev-app, and Yandex - not this scaler - picks which node to
+      # drain, so a lower floor could evict them. Two weeks of scale-down have
+      # now been observed without incident, and those three pods request 2.7 CPU
+      # / 4.4 GiB in total, which fits on a single 8 vCPU / 16 GiB node with room
+      # to spare - so an eviction reschedules rather than strands them. The old
+      # floor cost real money: 609 of 1123 worker-dev node-hours over 14 days
+      # (54%) carried no worker job at all, ~21k RUB/month for nothing.
+      min_size: 1
       scale_down_cooldown_polls: 3
       poll_interval_seconds: 30
       # Live on dev. Toggling this no longer needs a pod restart: the
