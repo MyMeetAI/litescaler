@@ -98,9 +98,9 @@ class ScalerService:
         sum_cpu, sum_mem = sum_pod_requests(pods)
 
         draining = ready_nodes > current_size
-        growing = operation_running or ready_nodes < current_size
+        in_flight_nodes = max(0, current_size - ready_nodes)
 
-        if draining or (growing and pods):
+        if draining:
             metrics.observe_poll(
                 pending_pods=len(pods),
                 demand_cpu_millicores=sum_cpu,
@@ -114,17 +114,6 @@ class ScalerService:
             reason = (
                 "operation_in_progress" if operation_running else "transitioning"
             )
-            if draining:
-                text = (
-                    f"node group shrinking (desired {current_size}, "
-                    f"ready {ready_nodes}); waiting before next resize"
-                )
-            else:
-                text = (
-                    f"node group growing (desired {current_size}, "
-                    f"ready {ready_nodes}) with {len(pods)} pod(s) pending; "
-                    "waiting for the new nodes before next resize"
-                )
             return self._apply(
                 Decision(
                     should_scale=False,
@@ -132,16 +121,20 @@ class ScalerService:
                     target_size=current_size,
                     nodes_to_add=0,
                     pending_count=len(pods),
-                    reason=text,
+                    reason=(
+                        f"node group shrinking (desired {current_size}, "
+                        f"ready {ready_nodes}); waiting before next resize"
+                    ),
                 ),
                 gated_reason=reason,
             )
 
-        if growing:
+        if in_flight_nodes or operation_running:
             logger.info(
                 "Scale-up still in flight (desired %d, ready %d, operation "
-                "running: %s) but nothing is pending; not waiting on it",
-                current_size, ready_nodes, operation_running,
+                "running: %s); counting %d node(s) still joining as free "
+                "capacity instead of waiting",
+                current_size, ready_nodes, operation_running, in_flight_nodes,
             )
 
         logger.info(
@@ -178,6 +171,7 @@ class ScalerService:
             config=self._config.scaling,
             free_by_node=[(n.cpu_millicores, n.mem_bytes) for n in free_nodes],
             pod_requests=[sum_pod_requests([p]) for p in pods],
+            in_flight_nodes=in_flight_nodes,
         )
 
         if decision.should_scale:

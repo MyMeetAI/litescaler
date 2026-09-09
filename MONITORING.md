@@ -153,22 +153,20 @@ increment them, so they cannot be inflated by a scaler that is not really
 scaling. A capped resize *does* count the nodes it moved.
 
 `evaluations_gated_total{reason}` counts polls skipped because the group was
-busy:
+busy. A poll is gated only while `ready_nodes` **exceeds** the desired size,
+i.e. nodes are still draining after a scale-down. The label says what else was
+true at the time:
 
 | `reason` | Meaning |
 |---|---|
-| `transitioning` | `ready_nodes` does not equal the desired size — the group is converging |
-| `operation_in_progress` | The last resize operation this process started has not completed |
+| `operation_in_progress` | Nodes draining and the last resize operation this process started has not completed |
+| `transitioning` | Nodes draining, no operation tracked (the operation finished or the process restarted) |
 
-Checked in that priority: `operation_in_progress` is tested first, so a poll
-that is both only counts as `operation_in_progress`.
-
-A poll is gated whenever `ready_nodes` exceeds the desired size (nodes are
-draining). When the group is *growing* — `ready_nodes` below the desired size,
-or the operation still running — it is gated only while pods are pending. A
-quiet poll during a scale-up is not gated: it counts toward the idle cooldown
-and can scale down, so a scale-up the cloud never fulfils cannot freeze the
-group.
+A *growing* group — `ready_nodes` below the desired size, or the operation
+still running with every node Ready — is never gated. The nodes on order are
+fed into the sizing as whole empty nodes, so a second wave of demand is
+ordered for at once and a quiet poll counts toward the idle cooldown; a
+scale-up the cloud never fulfils therefore cannot freeze the group.
 
 Sustained growth here while `litescaler_pending_pods > 0` is the signature
 failure to alert on: pods are waiting and the scaler is frozen behind a resize

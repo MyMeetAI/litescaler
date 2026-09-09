@@ -199,7 +199,7 @@ def test_evaluate_scales_when_free_capacity_is_fragmented(monkeypatch):
     yc.set_size.assert_called_once_with(8)
 
 
-def test_evaluate_skips_scale_up_while_node_group_transitioning(monkeypatch):
+def test_evaluate_no_rescale_when_pending_pods_fit_on_joining_nodes(monkeypatch):
     config = _config()
     svc, kube, yc = _service(
         config, _pods(2), (4000, 16 * 1024**3), current_size=1, ready_nodes=0
@@ -212,6 +212,44 @@ def test_evaluate_skips_scale_up_while_node_group_transitioning(monkeypatch):
 
     assert decision.should_scale is False
     yc.set_size.assert_not_called()
+
+
+def test_evaluate_skips_scale_up_while_nodes_are_draining(monkeypatch):
+    config = _config()
+    svc, kube, yc = _service(
+        config, _pods(2), (4000, 16 * 1024**3), current_size=1, ready_nodes=3
+    )
+    monkeypatch.setattr(
+        "app.service.sum_pod_requests", lambda p: (2000 * len(p), 1 * 1024**3)
+    )
+
+    decision = svc.evaluate()
+
+    assert decision.should_scale is False
+    yc.set_size.assert_not_called()
+
+
+def test_second_wave_scales_while_first_resize_is_in_flight(monkeypatch):
+    config = _config()
+    svc, kube, yc = _service(config, _pods(4), (4000, 16 * 1024**3), 2)
+    monkeypatch.setattr(
+        "app.service.sum_pod_requests", lambda p: (2000 * len(p), 1024**3 * len(p))
+    )
+
+    first = svc.evaluate()
+    assert first.target_size == 5
+    yc.set_size.assert_called_once_with(5)
+
+    kube.list_pending_pods.return_value = _pods(8)
+    yc.get_current_size.return_value = 5
+    kube.ready_group_node_count.return_value = 2
+    yc.operation_in_progress.return_value = True
+
+    second = svc.evaluate()
+
+    assert second.should_scale is True
+    assert second.target_size == 7
+    yc.set_size.assert_called_with(7)
 
 
 def test_evaluate_skips_scale_down_while_nodes_are_draining():
@@ -279,7 +317,9 @@ def test_evaluate_no_scale_up_when_ready_node_has_free_capacity(monkeypatch):
     yc.set_size.assert_not_called()
 
 
-def test_evaluate_skips_scale_while_operation_in_progress(monkeypatch):
+def test_evaluate_scales_up_when_operation_still_running_but_nodes_ready(
+    monkeypatch,
+):
     config = _config()
     svc, kube, yc = _service(config, _pods(2), (4000, 16 * 1024**3), 2)
     yc.operation_in_progress.return_value = True
@@ -289,8 +329,8 @@ def test_evaluate_skips_scale_while_operation_in_progress(monkeypatch):
 
     decision = svc.evaluate()
 
-    assert decision.should_scale is False
-    yc.set_size.assert_not_called()
+    assert decision.should_scale is True
+    yc.set_size.assert_called_once()
 
 
 def test_scale_by_resizes_to_clamped_target():
@@ -517,12 +557,12 @@ def test_dry_run_evaluate_records_a_dry_run_decision_and_no_nodes_added(
     assert _sample("litescaler_nodes_added_total", node_group_id="cat1") is None
 
 
-def test_a_transitioning_group_is_gated_as_transitioning(
+def test_a_draining_group_is_gated_as_transitioning(
     monkeypatch, fresh_metrics
 ):
     config = _config()
     svc, kube, yc = _service(
-        config, _pods(2), (4000, 16 * 1024**3), 4, ready_nodes=2
+        config, _pods(2), (4000, 16 * 1024**3), 2, ready_nodes=4
     )
     _flat_requests(monkeypatch)
 
@@ -536,7 +576,7 @@ def test_a_transitioning_group_is_gated_as_transitioning(
     ) == 1
 
 
-def test_a_running_resize_operation_is_gated_as_operation_in_progress(
+def test_a_running_resize_operation_alone_does_not_gate(
     monkeypatch, fresh_metrics,
 ):
     config = _config()
@@ -548,8 +588,25 @@ def test_a_running_resize_operation_is_gated_as_operation_in_progress(
 
     assert _sample(
         "litescaler_evaluations_gated_total", reason="operation_in_progress"
-    ) == 1
+    ) is None
     assert _sample("litescaler_resize_in_progress") == 1
+
+
+def test_a_draining_group_with_a_running_operation_is_gated_as_operation_in_progress(
+    monkeypatch, fresh_metrics,
+):
+    config = _config()
+    svc, kube, yc = _service(
+        config, _pods(2), (4000, 16 * 1024**3), 2, ready_nodes=4
+    )
+    yc.operation_in_progress.return_value = True
+    _flat_requests(monkeypatch)
+
+    svc.evaluate()
+
+    assert _sample(
+        "litescaler_evaluations_gated_total", reason="operation_in_progress"
+    ) == 1
 
 
 def test_manual_scale_counts_nodes_added(fresh_metrics):
@@ -574,6 +631,7 @@ def test_a_gated_poll_leaves_the_unmeasured_capacity_gauges_alone(
     svc.evaluate()
 
     yc.operation_in_progress.return_value = True
+    kube.ready_group_node_count.return_value = 4
     svc.evaluate()
 
     assert _sample("litescaler_group_free_cpu_millicores") == 500

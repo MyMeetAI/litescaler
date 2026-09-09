@@ -76,20 +76,26 @@ def decide(
     config: ScalingConfig,
     free_by_node: list[tuple[int, int]] | None = None,
     pod_requests: list[tuple[int, int]] | None = None,
+    in_flight_nodes: int = 0,
 ) -> Decision:
     free_by_node = list(free_by_node or [])
     pod_requests = list(pod_requests or [])
+    in_flight_nodes = max(0, in_flight_nodes)
+    ready_node_count = len(free_by_node)
+    free_by_node.extend(
+        [(node_cpu_millicores, node_mem_bytes)] * in_flight_nodes
+    )
     free_cpu_millicores = sum(cpu for cpu, _ in free_by_node)
     free_mem_bytes = sum(mem for _, mem in free_by_node)
     logger.info(
         "decide: pending=%d (threshold %d), requests %dm cpu / %s memory, "
-        "free in group %dm cpu / %s memory across %d node(s), "
-        "node size %dm cpu / %s memory, "
+        "free in group %dm cpu / %s memory across %d Ready node(s) plus "
+        "%d node(s) still joining, node size %dm cpu / %s memory, "
         "size %d (min %d, max %d), headroom %.0f%%",
         pending_count, config.pending_pod_threshold,
         sum_cpu_millicores, _gib(sum_mem_bytes),
-        free_cpu_millicores, _gib(free_mem_bytes), len(free_by_node),
-        node_cpu_millicores, _gib(node_mem_bytes),
+        free_cpu_millicores, _gib(free_mem_bytes), ready_node_count,
+        in_flight_nodes, node_cpu_millicores, _gib(node_mem_bytes),
         current_size, config.min_size, config.max_size, config.headroom * 100,
     )
 
@@ -160,6 +166,11 @@ def decide(
                 f"{len(unschedulable)} pending pods request more than a whole "
                 f"node ({node_cpu_millicores}m cpu / {_gib(node_mem_bytes)} "
                 "memory); no resize can schedule them"
+            )
+        elif in_flight_nodes:
+            reason = (
+                f"{pending_count} pending pods fit in existing free capacity "
+                f"including {in_flight_nodes} node(s) still joining; no action"
             )
         else:
             reason = (
