@@ -73,8 +73,16 @@ Acting on that unrealized size makes the scaler fight its own operation — addi
 second node before the first arrives, or tearing down freshly-added nodes that pods
 haven't landed on yet. So before issuing **any** resize the loop checks that the
 group has reached its desired size (`Ready` nodes in the group == desired) and that
-the previous resize operation has finished; while a resize is in flight it waits and
-does nothing.
+the previous resize operation has finished.
+
+The gate is one-sided, though. While nodes are **draining** after a scale-down
+the loop waits and does nothing. While nodes are still **joining** after a
+scale-up it only waits if pods are pending — those are most likely the pods the
+resize was ordered for. With nothing pending there is nothing to wait for: the
+idle cooldown keeps counting and empty nodes are released as usual. This matters
+when the cloud cannot deliver the ordered nodes at all (for example
+`RESOURCE_EXHAUSTED` in the zone): the group would otherwise sit pinned at a size
+it will never reach, unable to scale down.
 
 The `POST /evaluate` endpoint is a **manual override**: you tell it exactly how many
 nodes to add, and it scales the group by that amount (still clamped to `max_size`).

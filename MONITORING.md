@@ -163,6 +163,13 @@ busy:
 Checked in that priority: `operation_in_progress` is tested first, so a poll
 that is both only counts as `operation_in_progress`.
 
+A poll is gated whenever `ready_nodes` exceeds the desired size (nodes are
+draining). When the group is *growing* — `ready_nodes` below the desired size,
+or the operation still running — it is gated only while pods are pending. A
+quiet poll during a scale-up is not gated: it counts toward the idle cooldown
+and can scale down, so a scale-up the cloud never fulfils cannot freeze the
+group.
+
 Sustained growth here while `litescaler_pending_pods > 0` is the signature
 failure to alert on: pods are waiting and the scaler is frozen behind a resize
 that is not finishing. It is the difference between "not scaling because it

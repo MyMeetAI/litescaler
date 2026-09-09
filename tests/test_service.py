@@ -214,17 +214,51 @@ def test_evaluate_skips_scale_up_while_node_group_transitioning(monkeypatch):
     yc.set_size.assert_not_called()
 
 
-def test_evaluate_skips_scale_down_while_node_group_transitioning():
+def test_evaluate_skips_scale_down_while_nodes_are_draining():
     config = _config(min_size=0, scale_down_cooldown_polls=1)
     svc, kube, yc = _service(
         config, [], (4000, 16 * 1024**3), current_size=2,
-        empty_nodes=2, ready_nodes=1,
+        empty_nodes=3, ready_nodes=3,
     )
 
     decision = svc.evaluate()
 
     assert decision.should_scale is False
     yc.set_size.assert_not_called()
+
+
+def test_scale_down_proceeds_while_a_scale_up_is_stuck():
+    config = _config(min_size=0, scale_down_cooldown_polls=2)
+    svc, kube, yc = _service(
+        config, [], (4000, 16 * 1024**3), current_size=37,
+        empty_nodes=8, ready_nodes=35,
+    )
+    yc.operation_in_progress.return_value = True
+
+    first = svc.evaluate()
+    assert first.should_scale is False
+    yc.set_size.assert_not_called()
+
+    second = svc.evaluate()
+    assert second.should_scale is True
+    assert second.direction == "down"
+    assert second.target_size == 29
+    yc.set_size.assert_called_once_with(29)
+
+
+def test_scale_down_proceeds_when_only_the_operation_is_still_running():
+    config = _config(min_size=0, scale_down_cooldown_polls=1)
+    svc, kube, yc = _service(
+        config, [], (4000, 16 * 1024**3), current_size=5,
+        empty_nodes=2, ready_nodes=5,
+    )
+    yc.operation_in_progress.return_value = True
+
+    decision = svc.evaluate()
+
+    assert decision.should_scale is True
+    assert decision.target_size == 3
+    yc.set_size.assert_called_once_with(3)
 
 
 def test_evaluate_no_scale_up_when_ready_node_has_free_capacity(monkeypatch):
