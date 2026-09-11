@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lite-scaler-config
+data:
+  config.yaml: |
+    # Live on prod since 2026-08-31.
+    #
+    # The old blocker at the top of this file is gone. It said worker-prod was
+    # an auto_scale group owned by the Yandex cluster-autoscaler, that this
+    # scaler only understands fixed_scale, and that converting the group meant
+    # recreating it. All true - and Terraform confirmed the hard part: the
+    # scaling type and node_taints are replacement attributes, so switching the
+    # live group would have destroyed every burst node at once.
+    #
+    # So the group was not converted. A second one was created next to it
+    # (k8s-terraform: yandex_kubernetes_node_group.external_scaled
+    # ["worker-prod-burst"]), fixed_scale from birth, and this scaler owns its
+    # size. Both groups carry workload=general-prod, so worker pods schedule
+    # onto either; the old one is drained and removed once this one carries the
+    # load.
+    yandex_cloud:
+      service_account_key_file: /secrets/sa-key.json
+      # k8s-nodes-central1-a-prod-burst. NOT cat8gsfad91brpidohkl - that is the
+      # old auto_scale worker-prod, which this scaler must never touch.
+      node_group_id: cato54ig3tc5bgct3vvp
+      cluster_id: catp68de0kgi9fc22v0c
+      master_endpoint: internal
+
+    kubernetes:
+      namespace: bot-prod
+      label_selectors:
+        # Pods of the KEDA ScaledJob `bot-prod-general` - one Job per meeting,
+        # plus the warm pool (35 workers 04:00-21:00 MSK on weekdays, 5
+        # otherwise; BotsService `idleSchedule`).
+        - app=bot-prod-worker
+
+    scaling:
+      pending_pod_threshold: 0
+      headroom: 0.10
+      max_size: 45
+      # Capacity accounting caveat, unchanged from when this file was written:
+      # the scaler only measures nodes labelled
+      # yandex.cloud/node-group-id=<node_group_id>, but bot-prod pods select on
+      # workload=general-prod, which ALSO matches worker-prod-reserve. Free
+      # capacity on the reserve is therefore invisible here and the scaler can
+      # add a node the reserve would have absorbed. The reserve is one node now
+      # (15 worker slots) and runs full through the peak, so the overlap is
+      # small - but it is the first thing to check if scale-up looks eager.
+      #
+      # min_size 1, and the number is load-bearing: with worker-prod-reserve
+      # fixed at one node (15 worker slots) this is what the cluster costs when
+      # nothing is happening.
+      #
+      # 2 was wrong. A pool of 35 needs three nodes and a pool of 5 needs one,
+      # so a floor of 1 reserve + 2 burst is three nodes around the clock - the
+      # same three the peak needs. The schedule would have dropped the pool
+      # every night and saved nothing.
+      #
+      # 0 is wrong too, in the other direction. Measured over the 14 days to
+      # 2026-08-31, the off-peak queue runs p99 21 on weeknights and 18 at
+      # weekends, so 5 + 21 = 26 slots are wanted at the 99th percentile and the
+      # reserve alone offers 15. On 0 those spikes would wait out a scale-up:
+      # ~40s to decide, ~2 min for the node, ~2 more before the device plugin
+      # advertises squat.ai/video - five minutes before a meeting gets a bot.
+      #
+      # 1 covers p99 (26 of 30 slots) and only the outlier night - the 14-day
+      # max was 36 queued - reaches for a third node.
+      #
+      # What min_size does NOT do: grow the group. It is a floor for scale-down
+      # only (app/scaling.py: target = max(current_size - empty, min_size));
+      # scale-up is driven purely by Pending pods.
+      min_size: 1
+      scale_down_cooldown_polls: 3
+      poll_interval_seconds: 30
+      # Live, not a dry run: prod capacity has to actually follow the load.
+      dry_run: false
+      log_level: INFO
+      node_capacity_fallback:           # matches worker-prod-burst: highfreq-v3 32 vCPU / 64 GiB
+        cpu: 32
+        memory_gib: 64
+
+    metrics:
+      enabled: true
+      port: 9090

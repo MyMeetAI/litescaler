@@ -5,5 +5,34 @@ metadata:
 spec:
   template:
     spec:
+      # Pin to a node the scaler never resizes. Landing on worker-dev — the group
+      # it manages — would let its own scale-down drain the node it runs on.
+      #
+      # Upstream fills these placeholders with `lite-scaler=true` /
+      # `dedicated=lite-scaler` (dce62d5), which is their environment. We keep our
+      # own values: this cluster has no lite-scaler-labelled node, and the pod
+      # actually runs on the existing infra group. Expect this file to conflict on
+      # every upstream merge — ours wins.
       nodeSelector:
-        REPLACE_WITH_NODE_LABEL_KEY: REPLACE_WITH_NODE_LABEL_VALUE
+        workload: infra
+      # infra nodes carry `dedicated=infra:NoSchedule`, so the nodeSelector alone
+      # leaves the pod Pending forever. The toleration is what makes it schedule.
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: infra
+          effect: NoSchedule
+      containers:
+        - name: lite-scaler
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 200m
+              # 128Mi OOM-killed the pod (exit 137) on every poll: free-capacity
+              # accounting calls list_pod_for_all_namespaces(), which deserialises
+              # EVERY pod in the cluster — 702 here — not just those on the 3 nodes
+              # it measures. Measured steady state at that size: 208Mi / 81m cpu.
+              # Note the footprint tracks TOTAL cluster size, not this node group.
+              memory: 512Mi

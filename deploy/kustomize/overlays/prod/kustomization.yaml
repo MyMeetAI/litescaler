@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kube-system
+
+resources:
+  - ../../base
+
+# The dev instance already occupies the base names in this namespace. Without
+# a distinct name AND a distinct app label, applying this overlay would not add
+# a second scaler - it would overwrite the dev one, and the two Deployments
+# would fight over the same pods through an identical selector.
+nameSuffix: -prod
+
+labels:
+  - pairs:
+      app: lite-scaler-prod
+    includeSelectors: true
+
+patches:
+  - path: config-patch.yaml
+    target:
+      kind: ConfigMap
+      name: lite-scaler-config
+  - path: deployment-patch.yaml
+
+images:
+  - name: cr.yandex/crpcvsde88m85as3hdu0/lite-scaler
+    # The build dev has been running since 2026-08-20. Prod pins an immutable
+    # tag on purpose: a rolling restart must bring back the build that was
+    # watched, not whatever was pushed to :latest since.
+    newTag: "96d3218"

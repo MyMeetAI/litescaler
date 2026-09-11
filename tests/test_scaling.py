@@ -1,7 +1,7 @@
 import math
 
 from app.config import ScalingConfig
-from app.scaling import Decision, decide
+from app.scaling import Decision, decide, decide_manual, decide_scale_down
 
 
 def cfg(**kw):
@@ -137,8 +137,7 @@ def test_free_capacity_covers_demand_no_scale():
         node_mem_bytes=NODE_MEM,
         current_size=2,
         config=cfg(),
-        free_cpu_millicores=8000,
-        free_mem_bytes=4 * 1024**3,
+        free_by_node=[(4000, 2 * 1024**3), (4000, 2 * 1024**3)],
     )
     assert d.should_scale is False
     assert d.target_size == 2
@@ -154,12 +153,97 @@ def test_free_capacity_only_covers_part_scales_for_shortfall():
         node_mem_bytes=NODE_MEM,
         current_size=1,
         config=cfg(),
-        free_cpu_millicores=4000,
-        free_mem_bytes=0,
+        free_by_node=[(4000, 0)],
     )
     assert d.should_scale is True
     assert d.nodes_to_add == 2
     assert d.target_size == 3
+
+
+FRAG_NODE_CPU = 7910
+FRAG_NODE_MEM = 32 * 1024**3
+
+
+def test_fragmented_free_capacity_still_scales():
+    d = decide(
+        pending_count=2,
+        sum_cpu_millicores=4000,
+        sum_mem_bytes=2 * 1024**3,
+        node_cpu_millicores=FRAG_NODE_CPU,
+        node_mem_bytes=FRAG_NODE_MEM,
+        current_size=7,
+        config=cfg(pending_pod_threshold=0),
+        free_by_node=[(1440, 5 * 1024**3)] * 7,
+        pod_requests=[(2000, 1 * 1024**3), (2000, 1 * 1024**3)],
+    )
+    assert d.should_scale is True
+    assert d.nodes_to_add == 1
+    assert d.target_size == 8
+    assert "fit" in d.reason.lower()
+
+
+def test_fragmented_memory_still_scales():
+    d = decide(
+        pending_count=1,
+        sum_cpu_millicores=500,
+        sum_mem_bytes=8 * 1024**3,
+        node_cpu_millicores=FRAG_NODE_CPU,
+        node_mem_bytes=FRAG_NODE_MEM,
+        current_size=4,
+        config=cfg(pending_pod_threshold=0),
+        free_by_node=[(4000, 3 * 1024**3)] * 4,
+        pod_requests=[(500, 8 * 1024**3)],
+    )
+    assert d.should_scale is True
+    assert d.nodes_to_add == 1
+
+
+def test_pods_that_fit_on_one_node_do_not_scale():
+    d = decide(
+        pending_count=2,
+        sum_cpu_millicores=2000,
+        sum_mem_bytes=2 * 1024**3,
+        node_cpu_millicores=FRAG_NODE_CPU,
+        node_mem_bytes=FRAG_NODE_MEM,
+        current_size=3,
+        config=cfg(pending_pod_threshold=0),
+        free_by_node=[(1440, 5 * 1024**3), (7910, 32 * 1024**3)],
+        pod_requests=[(1000, 1 * 1024**3), (1000, 1 * 1024**3)],
+    )
+    assert d.should_scale is False
+    assert "free capacity" in d.reason.lower()
+
+
+def test_packing_opens_one_node_per_oversized_pod():
+    d = decide(
+        pending_count=4,
+        sum_cpu_millicores=20_000,
+        sum_mem_bytes=4 * 1024**3,
+        node_cpu_millicores=8000,
+        node_mem_bytes=32 * 1024**3,
+        current_size=1,
+        config=cfg(pending_pod_threshold=0),
+        free_by_node=[(0, 0)],
+        pod_requests=[(5000, 1 * 1024**3)] * 4,
+    )
+    assert d.should_scale is True
+    assert d.nodes_to_add == 4
+
+
+def test_pod_bigger_than_a_whole_node_does_not_scale():
+    d = decide(
+        pending_count=1,
+        sum_cpu_millicores=16_000,
+        sum_mem_bytes=1 * 1024**3,
+        node_cpu_millicores=8000,
+        node_mem_bytes=32 * 1024**3,
+        current_size=2,
+        config=cfg(pending_pod_threshold=0),
+        free_by_node=[(0, 0), (0, 0)],
+        pod_requests=[(16_000, 1 * 1024**3)],
+    )
+    assert d.should_scale is False
+    assert "node" in d.reason.lower()
 
 
 from app.scaling import decide_manual  # noqa: E402
@@ -221,3 +305,125 @@ def test_scale_down_already_at_floor_no_action():
     assert d.should_scale is False
     assert d.target_size == 1
     assert d.nodes_to_add == 0
+
+
+def _up_config(**kw):
+    return ScalingConfig(headroom=0.0, pending_pod_threshold=0, **kw)
+
+
+def test_scale_up_within_max_size_is_not_capped():
+    decision = decide(
+        pending_count=1, sum_cpu_millicores=2000, sum_mem_bytes=8 * 1024**3,
+        node_cpu_millicores=2000, node_mem_bytes=8 * 1024**3,
+        current_size=1, config=_up_config(max_size=10),
+    )
+
+    assert decision.direction == "up"
+    assert decision.capped is False
+
+
+def test_scale_up_clamped_by_max_size_is_capped():
+    decision = decide(
+        pending_count=4, sum_cpu_millicores=8000, sum_mem_bytes=32 * 1024**3,
+        node_cpu_millicores=2000, node_mem_bytes=8 * 1024**3,
+        current_size=1, config=_up_config(max_size=2),
+    )
+
+    assert decision.should_scale is True
+    assert decision.direction == "up"
+    assert decision.capped is True
+
+
+def test_already_at_max_size_is_a_capped_up_decision():
+    decision = decide(
+        pending_count=4, sum_cpu_millicores=8000, sum_mem_bytes=32 * 1024**3,
+        node_cpu_millicores=2000, node_mem_bytes=8 * 1024**3,
+        current_size=2, config=_up_config(max_size=2),
+    )
+
+    assert decision.should_scale is False
+    assert decision.direction == "up"
+    assert decision.capped is True
+
+
+def test_no_pending_pods_is_a_none_direction_decision():
+    decision = decide(
+        pending_count=0, sum_cpu_millicores=0, sum_mem_bytes=0,
+        node_cpu_millicores=2000, node_mem_bytes=8 * 1024**3,
+        current_size=1, config=_up_config(max_size=10),
+    )
+
+    assert decision.direction == "none"
+    assert decision.capped is False
+
+
+def test_manual_scale_clamped_by_max_size_is_capped():
+    decision = decide_manual(nodes_to_add=5, current_size=1, max_size=3)
+
+    assert decision.direction == "up"
+    assert decision.capped is True
+
+
+def test_manual_scale_within_max_size_is_not_capped():
+    decision = decide_manual(nodes_to_add=2, current_size=1, max_size=10)
+
+    assert decision.direction == "up"
+    assert decision.capped is False
+
+
+def test_scale_down_clamped_by_min_size_is_capped():
+    decision = decide_scale_down(empty_node_count=5, current_size=4, min_size=2)
+
+    assert decision.should_scale is True
+    assert decision.direction == "down"
+    assert decision.capped is True
+
+
+def test_scale_down_within_min_size_is_not_capped():
+    decision = decide_scale_down(empty_node_count=2, current_size=5, min_size=1)
+
+    assert decision.direction == "down"
+    assert decision.capped is False
+
+
+def test_nothing_to_scale_down_is_a_none_direction_decision():
+    decision = decide_scale_down(empty_node_count=0, current_size=3, min_size=1)
+
+    assert decision.direction == "none"
+    assert decision.capped is False
+
+
+def test_in_flight_nodes_count_as_free_capacity():
+    d = decide(
+        pending_count=4,
+        sum_cpu_millicores=8000,
+        sum_mem_bytes=4 * 1024**3,
+        node_cpu_millicores=NODE_CPU,
+        node_mem_bytes=NODE_MEM,
+        current_size=4,
+        config=cfg(),
+        free_by_node=[],
+        pod_requests=[(2000, 1024**3)] * 4,
+        in_flight_nodes=2,
+    )
+    assert d.should_scale is False
+    assert d.nodes_to_add == 0
+    assert "joining" in d.reason
+
+
+def test_in_flight_nodes_only_cover_part_of_the_demand():
+    d = decide(
+        pending_count=8,
+        sum_cpu_millicores=16000,
+        sum_mem_bytes=8 * 1024**3,
+        node_cpu_millicores=NODE_CPU,
+        node_mem_bytes=NODE_MEM,
+        current_size=4,
+        config=cfg(),
+        free_by_node=[],
+        pod_requests=[(2000, 1024**3)] * 8,
+        in_flight_nodes=2,
+    )
+    assert d.should_scale is True
+    assert d.nodes_to_add == 3
+    assert d.target_size == 7

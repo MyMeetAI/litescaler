@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from app import metrics
 from app.config import Config
 from app.k8s import KubeClient, format_cpu, format_mem, sum_pod_requests
 from app.scaling import Decision, decide, decide_manual, decide_scale_down
@@ -16,7 +17,6 @@ class ScalerService:
         self._kube = kube
         self._yc = yc
         self.last_decision: Decision | None = None
-        self._handled_pods: set[str] = set()
         self._idle_polls: int = 0
 
     @property
@@ -54,7 +54,7 @@ class ScalerService:
             int(fallback.memory_gib * 1024**3),
         )
 
-    def _apply(self, decision: Decision) -> Decision:
+    def _apply(self, decision: Decision, gated_reason: str | None = None) -> Decision:
         logger.info("Decision: %s", decision.reason)
 
         if decision.should_scale:
@@ -62,6 +62,16 @@ class ScalerService:
                 logger.info("dry_run enabled; skipping resize to %d", decision.target_size)
             else:
                 self._yc.set_size(decision.target_size)
+
+        metrics.record_decision(
+            direction=decision.direction,
+            nodes_to_add=decision.nodes_to_add,
+            capped=decision.capped,
+            should_scale=decision.should_scale,
+            dry_run=self._config.scaling.dry_run,
+            node_group_id=self._config.yandex_cloud.node_group_id,
+            gated_reason=gated_reason,
+        )
 
         self.last_decision = decision
         return decision
@@ -74,20 +84,7 @@ class ScalerService:
             k.label_selectors, self._config.scaling.dry_run,
         )
         pods = self._kube.list_pending_pods(k.namespace, k.label_selectors)
-        existing = self._kube.matching_pod_uids(k.namespace, k.label_selectors)
-        forgotten = self._handled_pods - existing
-        if forgotten:
-            logger.debug(
-                "Forgetting %d already-handled pod(s) that no longer exist",
-                len(forgotten),
-            )
-        self._handled_pods &= existing
-        new_pods = [p for p in pods if p.metadata.uid not in self._handled_pods]
-        logger.info(
-            "Pending pods: %d unscheduled, %d already accounted for by an "
-            "earlier resize, %d new for this decision",
-            len(pods), len(pods) - len(new_pods), len(new_pods),
-        )
+        logger.info("Pending pods: %d unscheduled", len(pods))
         current_size = self._yc.get_current_size()
         ready_nodes = self._kube.ready_group_node_count(
             self._config.yandex_cloud.node_group_id
@@ -98,51 +95,88 @@ class ScalerService:
             "resize operation in progress: %s",
             current_size, ready_nodes, operation_running,
         )
-        if ready_nodes != current_size or operation_running:
+        sum_cpu, sum_mem = sum_pod_requests(pods)
+
+        draining = ready_nodes > current_size
+        in_flight_nodes = max(0, current_size - ready_nodes)
+
+        if draining:
+            metrics.observe_poll(
+                pending_pods=len(pods),
+                demand_cpu_millicores=sum_cpu,
+                demand_memory_bytes=sum_mem,
+                node_group_size=current_size,
+                ready_nodes=ready_nodes,
+                resize_in_progress=operation_running,
+            )
             if pods:
                 self._idle_polls = 0
-            return self._apply(Decision(
-                should_scale=False,
-                current_size=current_size,
-                target_size=current_size,
-                nodes_to_add=0,
-                pending_count=len(new_pods),
-                reason=(
-                    f"node group transitioning (desired {current_size}, "
-                    f"ready {ready_nodes}); waiting before next resize"
+            reason = (
+                "operation_in_progress" if operation_running else "transitioning"
+            )
+            return self._apply(
+                Decision(
+                    should_scale=False,
+                    current_size=current_size,
+                    target_size=current_size,
+                    nodes_to_add=0,
+                    pending_count=len(pods),
+                    reason=(
+                        f"node group shrinking (desired {current_size}, "
+                        f"ready {ready_nodes}); waiting before next resize"
+                    ),
                 ),
-            ))
+                gated_reason=reason,
+            )
 
-        sum_cpu, sum_mem = sum_pod_requests(new_pods)
+        if in_flight_nodes or operation_running:
+            logger.info(
+                "Scale-up still in flight (desired %d, ready %d, operation "
+                "running: %s); counting %d node(s) still joining as free "
+                "capacity instead of waiting",
+                current_size, ready_nodes, operation_running, in_flight_nodes,
+            )
+
         logger.info(
-            "New pending pods request %s cpu / %s memory in total",
+            "Pending pods request %s cpu / %s memory in total",
             format_cpu(sum_cpu), format_mem(sum_mem),
         )
         node_cpu, node_mem = self._node_capacity()
-        free_cpu, free_mem = self._kube.group_free_capacity(
+        free_nodes = self._kube.group_free_capacity(
             self._config.yandex_cloud.node_group_id
         )
 
+        metrics.observe_poll(
+            pending_pods=len(pods),
+            demand_cpu_millicores=sum_cpu,
+            demand_memory_bytes=sum_mem,
+            node_group_size=current_size,
+            ready_nodes=ready_nodes,
+            resize_in_progress=operation_running,
+        )
+        metrics.observe_capacity(
+            free_cpu_millicores=sum(n.cpu_millicores for n in free_nodes),
+            free_memory_bytes=sum(n.mem_bytes for n in free_nodes),
+            node_capacity_cpu_millicores=node_cpu,
+            node_capacity_memory_bytes=node_mem,
+        )
+
         decision = decide(
-            pending_count=len(new_pods),
+            pending_count=len(pods),
             sum_cpu_millicores=sum_cpu,
             sum_mem_bytes=sum_mem,
             node_cpu_millicores=node_cpu,
             node_mem_bytes=node_mem,
             current_size=current_size,
             config=self._config.scaling,
-            free_cpu_millicores=free_cpu,
-            free_mem_bytes=free_mem,
+            free_by_node=[(n.cpu_millicores, n.mem_bytes) for n in free_nodes],
+            pod_requests=[sum_pod_requests([p]) for p in pods],
+            in_flight_nodes=in_flight_nodes,
         )
 
         if decision.should_scale:
             result = self._apply(decision)
-            self._handled_pods |= {p.metadata.uid for p in new_pods}
             self._idle_polls = 0
-            logger.debug(
-                "Remembering %d pod(s) as handled; idle counter reset",
-                len(new_pods),
-            )
             return result
 
         if pods:

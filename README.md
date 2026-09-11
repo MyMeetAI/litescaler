@@ -10,14 +10,26 @@ any configured label selector **and are still unscheduled** (no `nodeName`). Pod
 that are already on a node but stuck — `ImagePullBackOff`, crash loops, etc. — stay
 `phase=Pending` yet do *not* need more capacity, so they are ignored. If the count
 of genuinely unschedulable pods exceeds `pending_pod_threshold`
-(default `0`, i.e. a single Pending pod is enough), it sums their CPU/memory
-requests, **subtracts the unreserved capacity already available on Ready nodes in
-the group** (a node just added is `Ready` before the scheduler has placed the
-Pending pods onto it — counting its free space stops a second node being added for
-pods the first will absorb), divides the remaining demand by the allocatable
-capacity of a node **of the managed group**, adds `headroom` (15%), and resizes the node group to
-`current + nodes_needed` (capped at `max_size`). If existing free capacity already
-covers the demand, it does nothing.
+(default `0`, i.e. a single Pending pod is enough), it sizes the resize two ways
+and takes the larger:
+
+1. **By demand.** It sums their CPU/memory requests, **subtracts the unreserved
+   capacity already available on Ready nodes in the group** (a node just added is
+   `Ready` before the scheduler has placed the Pending pods onto it — counting its
+   free space stops a second node being added for pods the first will absorb),
+   divides the remaining demand by the allocatable capacity of a node **of the
+   managed group**, and adds `headroom` (15%).
+2. **By fit.** Free capacity is not a pool: a pod only runs where a *single* node
+   has room for its whole request. So the pending pods are packed, largest first,
+   onto the free space of each node individually; whatever finds no node opens a
+   fresh one. Seven nodes with 1440m free each hold 9480m in total and still
+   cannot take one 2000m pod — by demand alone that pod looks satisfied and stays
+   `Pending` forever, so the fit count overrides it.
+
+It then resizes the node group to `current + nodes_needed` (capped at
+`max_size`). If the pods fit in existing free capacity, it does nothing. A pod
+requesting more than a whole node is logged as unschedulable and excluded from
+both counts — no group size can ever place it.
 
 **Scale-down.** When no matching pod has been `Pending` for
 `scale_down_cooldown_polls` consecutive polls (default 3), the loop counts
@@ -29,21 +41,22 @@ matching the label selectors — and lowers the group size by that count, down t
 drained node is safe. Any `Pending` matching pod suppresses scale-down and
 resets the cooldown — scale-up always wins.
 
-**Scale once per pod.** The loop remembers the `Pending` pods it has already
-scaled for (by pod UID). On each poll it only considers pods it has *not* handled
-yet, so:
+**No double-ordering.** Capacity is never ordered twice for the same pods,
+because every poll re-derives the answer from the cluster as it *currently* is:
 
-- it won't add nodes again for the same pods while the previous cycle's nodes are
-  still being created, but
-- it *will* react to brand-new `Pending` pods immediately, even mid-provisioning.
+- while a scale-up is in flight, every node that was ordered but is not `Ready`
+  yet counts as a whole empty node, so pods waiting on nodes that are still
+  being created already fit and cannot trigger a second order for them — but a
+  second wave of pods that does *not* fit on those nodes is ordered for at once,
+  without waiting for the first wave to land;
+- once those nodes are `Ready`, their real free space is counted instead, so
+  pods the scheduler has not placed yet already fit and no more nodes are
+  ordered.
 
-A handled pod is forgotten only once it **no longer exists at all** — not when it
-merely gets scheduled. A pod that lands on a node and then sticks in
-`ImagePullBackOff` leaves the unscheduled-`Pending` queue but keeps existing; if it
-were forgotten there it could re-enter the queue (node churn, re-scheduling) and
-look like brand-new demand, scaling again for a pod that can never run. Only pods
-that actually triggered a scale-up are remembered — below-threshold pods stay
-eligible so they can accumulate.
+A pod that is *still* unschedulable after a resize has landed is therefore
+re-considered rather than remembered as handled — the capacity it was given did
+not fit it, and suppressing it permanently would leave it `Pending` forever with
+the scaler reporting "no action".
 
 **Only the managed group is measured.** Every capacity number comes from nodes
 labeled `yandex.cloud/node-group-id=<node_group_id>`: the per-node size used to
@@ -59,12 +72,23 @@ warning is logged.
 
 **Wait for in-flight resizes (stability gate).** A `fixed_scale` group reports its
 *desired* size immediately, before the nodes actually join (or finish deleting).
-Acting on that unrealized size makes the scaler fight its own operation — adding a
-second node before the first arrives, or tearing down freshly-added nodes that pods
-haven't landed on yet. So before issuing **any** resize the loop checks that the
-group has reached its desired size (`Ready` nodes in the group == desired) and that
-the previous resize operation has finished; while a resize is in flight it waits and
-does nothing.
+Acting on that unrealized size naively makes the scaler fight its own operation —
+adding a second node before the first arrives, or tearing down freshly-added nodes
+that pods haven't landed on yet. The loop handles the two directions differently.
+
+While nodes are **draining** after a scale-down (`Ready` nodes in the group >
+desired) the loop waits and does nothing; the capacity it would measure is about
+to disappear.
+
+While nodes are still **joining** after a scale-up (`Ready` nodes < desired) the
+loop keeps deciding. The nodes on order are counted as whole empty nodes (see "No
+double-ordering" above), so the pods they were ordered for are not ordered for
+twice, a new wave of demand beyond them is acted on immediately, and with nothing
+pending the idle cooldown keeps counting and empty nodes are released as usual.
+The latter matters when the cloud cannot deliver the ordered nodes at all (for
+example `RESOURCE_EXHAUSTED` in the zone): the group would otherwise sit pinned at
+a size it will never reach, unable to scale down. The resize operation's own
+"done" flag is reported in the logs and metrics but is not a gate by itself.
 
 The `POST /evaluate` endpoint is a **manual override**: you tell it exactly how many
 nodes to add, and it scales the group by that amount (still clamped to `max_size`).
@@ -95,26 +119,31 @@ Every step that feeds a decision is logged, so a `dry_run: true` deployment can 
 audited from the log alone. One poll at `INFO` reads top to bottom:
 
 ```
---- evaluate: group=cat-ml-gpu ns=default selectors=['tag=demo'] dry_run=True
-Pending pods in ns=default: 3 total, 3 match ['tag=demo'], 3 still unscheduled
-Pending pods: 3 unscheduled, 0 already accounted for by an earlier resize, 3 new for this decision
-Ready nodes in group cat-ml-gpu: 2 (cluster has 4 nodes in total)
-Node group state: desired size 2, ready nodes 2, resize operation in progress: False
-New pending pods request 24000m cpu / 48.00Gi memory in total
-Node capacity of group cat-ml-gpu: 16000m cpu / 64.00Gi memory per node (from 2 Ready node(s))
-Free capacity across 2 Ready node(s) of group cat-ml-gpu: 20000m cpu / 96.00Gi memory
-decide: pending=3 (threshold 0), requests 24000m cpu / 48.00Gi memory, free in group 20000m ...
-decide: unmet demand after free capacity: 4000m cpu / 0.00Gi memory -> 0.25 nodes by cpu, 0.00 nodes by memory; max * (1 + 0.10 headroom) = 0.28 -> ceil = 1 nodes needed
-decide: 2 + 1 = 3 wanted, capped by max_size 20 -> target 3 (+1)
-Decision: 3 pending pods need ~1 nodes (+10% headroom); scaling 2 -> 3
-dry_run enabled; skipping resize to 3
+2026-08-14 09:12:41+0000 INFO    app.service: --- evaluate: group=cat-ml-gpu ns=default selectors=['tag=demo'] dry_run=True
+2026-08-14 09:12:41+0000 INFO    app.k8s: Pending pods in ns=default: 3 total, 3 match ['tag=demo'], 3 still unscheduled
+2026-08-14 09:12:41+0000 INFO    app.service: Pending pods: 3 unscheduled
+2026-08-14 09:12:41+0000 INFO    app.k8s: Ready nodes in group cat-ml-gpu: 2 (cluster has 4 nodes in total)
+2026-08-14 09:12:41+0000 INFO    app.service: Node group state: desired size 2, ready nodes 2, resize operation in progress: False
+2026-08-14 09:12:41+0000 INFO    app.service: Pending pods request 24000m cpu / 48.00Gi memory in total
+2026-08-14 09:12:41+0000 INFO    app.k8s: Node capacity of group cat-ml-gpu: 16000m cpu / 64.00Gi memory per node (from 2 Ready node(s))
+2026-08-14 09:12:41+0000 INFO    app.k8s: Free capacity across 2 Ready node(s) of group cat-ml-gpu: 20000m cpu / 96.00Gi memory in total, largest single node 10000m cpu / 48.00Gi memory
+2026-08-14 09:12:41+0000 INFO    app.scaling: decide: pending=3 (threshold 0), requests 24000m cpu / 48.00Gi memory, free in group 20000m cpu / 96.00Gi memory across 2 node(s), ...
+2026-08-14 09:12:41+0000 INFO    app.scaling: decide: packing 3 pending pod(s) onto per-node free capacity ['10000m/48.00Gi', '10000m/48.00Gi'] -> 1 new node(s) needed, 0 pod(s) too big for any node
+2026-08-14 09:12:41+0000 INFO    app.scaling: decide: unmet demand after free capacity: 4000m cpu / 0.00Gi memory -> 0.25 nodes by cpu, 0.00 nodes by memory; max * (1 + 0.10 headroom) = 0.28 -> ceil = 1; packing needs 1 -> 1 nodes needed
+2026-08-14 09:12:41+0000 INFO    app.scaling: decide: 2 + 1 = 3 wanted, capped by max_size 20 -> target 3 (+1)
+2026-08-14 09:12:41+0000 INFO    app.service: Decision: 3 pending pods need ~1 nodes (+10% headroom); scaling 2 -> 3
+2026-08-14 09:12:41+0000 INFO    app.service: dry_run enabled; skipping resize to 3
 ```
 
+Every line carries a local timestamp (with UTC offset), the level and the logger
+that emitted it; uvicorn's own startup and access lines are timestamped the same
+way.
+
 `log_level: DEBUG` additionally names each pending pod with its requests, each
-group node with its allocatable/requested/free split, the node names behind every
-count, and which pods are remembered or forgotten. Anything that could silently
-skew a decision — no `Ready` node in the group, a node reporting no allocatable,
-mixed node sizes within the group — is a `WARNING`.
+group node with its allocatable/requested/free split, and the node names behind
+every count. Anything that could silently skew a decision — no `Ready` node in
+the group, a node reporting no allocatable, mixed node sizes within the group, a
+pod too big for any node — is a `WARNING`.
 
 ### Cluster connection
 
@@ -156,6 +185,36 @@ curl -X POST localhost:8000/evaluate \
   -d '{"nodes_to_add": 3}'
 ```
 
+## Metrics
+
+Prometheus metrics are served on their own port (`9090` by default), separate
+from the API, so the scrape target never overlaps with `/evaluate`:
+
+```yaml
+metrics:
+  enabled: true
+  port: 9090
+```
+
+```bash
+curl localhost:9090/metrics
+```
+
+The base Deployment exposes the port as `metrics` and carries the
+`prometheus.io/{scrape,port,path}` pod annotations, so a cluster running the
+annotation-based scrape config picks the pod up with no extra configuration.
+
+Exposed are the scaling decision inputs (pending pods and their CPU/memory
+demand, free capacity in the group, node size), the group state (desired size,
+Ready nodes, resize in progress, configured bounds, `dry_run`), the decisions
+themselves (`direction` x `result`, nodes added and removed, evaluations
+skipped by a gate) and loop health (Yandex Cloud API errors per operation, IAM
+token mints, poll iterations, errors and duration, last poll timestamp, build
+info).
+
+See **[MONITORING.md](MONITORING.md)** for the full metric reference, scrape
+configuration, alerting rules and dashboard queries.
+
 ## Build the image
 
 ```bash
@@ -171,7 +230,7 @@ split by who needs the Yandex Cloud API and what is safe to keep in Git:
 - **Terraform** (`deploy/terraform/`) provisions the cloud bits — a dedicated
   service account, its two IAM grants (`k8s.editor` +
   `k8s.cluster-api.cluster-admin`, see [Cluster connection](#cluster-connection)),
-  the SA key, and the Kubernetes `Secret` (`lite-scaller-sa`) that carries it.
+  the SA key, and the Kubernetes `Secret` (`lite-scaler-sa`) that carries it.
   The cluster and node group are **pre-existing** — Terraform only references them.
 - **Kustomize** (`deploy/kustomize/`) owns the manifests — a `base/` (Deployment +
   default `config.yaml`) plus one overlay per environment
