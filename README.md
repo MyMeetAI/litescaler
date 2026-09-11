@@ -44,11 +44,14 @@ resets the cooldown — scale-up always wins.
 **No double-ordering.** Capacity is never ordered twice for the same pods,
 because every poll re-derives the answer from the cluster as it *currently* is:
 
-- while a resize is in flight the loop does nothing at all (see the stability
-  gate below), so pods waiting on nodes that are still being created cannot
-  trigger a second resize;
-- once those nodes are `Ready`, their free space is counted, so pods the
-  scheduler has not placed yet already fit and no more nodes are ordered.
+- while a scale-up is in flight, every node that was ordered but is not `Ready`
+  yet counts as a whole empty node, so pods waiting on nodes that are still
+  being created already fit and cannot trigger a second order for them — but a
+  second wave of pods that does *not* fit on those nodes is ordered for at once,
+  without waiting for the first wave to land;
+- once those nodes are `Ready`, their real free space is counted instead, so
+  pods the scheduler has not placed yet already fit and no more nodes are
+  ordered.
 
 A pod that is *still* unschedulable after a resize has landed is therefore
 re-considered rather than remembered as handled — the capacity it was given did
@@ -69,12 +72,23 @@ warning is logged.
 
 **Wait for in-flight resizes (stability gate).** A `fixed_scale` group reports its
 *desired* size immediately, before the nodes actually join (or finish deleting).
-Acting on that unrealized size makes the scaler fight its own operation — adding a
-second node before the first arrives, or tearing down freshly-added nodes that pods
-haven't landed on yet. So before issuing **any** resize the loop checks that the
-group has reached its desired size (`Ready` nodes in the group == desired) and that
-the previous resize operation has finished; while a resize is in flight it waits and
-does nothing.
+Acting on that unrealized size naively makes the scaler fight its own operation —
+adding a second node before the first arrives, or tearing down freshly-added nodes
+that pods haven't landed on yet. The loop handles the two directions differently.
+
+While nodes are **draining** after a scale-down (`Ready` nodes in the group >
+desired) the loop waits and does nothing; the capacity it would measure is about
+to disappear.
+
+While nodes are still **joining** after a scale-up (`Ready` nodes < desired) the
+loop keeps deciding. The nodes on order are counted as whole empty nodes (see "No
+double-ordering" above), so the pods they were ordered for are not ordered for
+twice, a new wave of demand beyond them is acted on immediately, and with nothing
+pending the idle cooldown keeps counting and empty nodes are released as usual.
+The latter matters when the cloud cannot deliver the ordered nodes at all (for
+example `RESOURCE_EXHAUSTED` in the zone): the group would otherwise sit pinned at
+a size it will never reach, unable to scale down. The resize operation's own
+"done" flag is reported in the logs and metrics but is not a gate by itself.
 
 The `POST /evaluate` endpoint is a **manual override**: you tell it exactly how many
 nodes to add, and it scales the group by that amount (still clamped to `max_size`).

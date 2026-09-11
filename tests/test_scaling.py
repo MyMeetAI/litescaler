@@ -391,3 +391,39 @@ def test_nothing_to_scale_down_is_a_none_direction_decision():
 
     assert decision.direction == "none"
     assert decision.capped is False
+
+
+def test_in_flight_nodes_count_as_free_capacity():
+    d = decide(
+        pending_count=4,
+        sum_cpu_millicores=8000,
+        sum_mem_bytes=4 * 1024**3,
+        node_cpu_millicores=NODE_CPU,
+        node_mem_bytes=NODE_MEM,
+        current_size=4,
+        config=cfg(),
+        free_by_node=[],
+        pod_requests=[(2000, 1024**3)] * 4,
+        in_flight_nodes=2,
+    )
+    assert d.should_scale is False
+    assert d.nodes_to_add == 0
+    assert "joining" in d.reason
+
+
+def test_in_flight_nodes_only_cover_part_of_the_demand():
+    d = decide(
+        pending_count=8,
+        sum_cpu_millicores=16000,
+        sum_mem_bytes=8 * 1024**3,
+        node_cpu_millicores=NODE_CPU,
+        node_mem_bytes=NODE_MEM,
+        current_size=4,
+        config=cfg(),
+        free_by_node=[],
+        pod_requests=[(2000, 1024**3)] * 8,
+        in_flight_nodes=2,
+    )
+    assert d.should_scale is True
+    assert d.nodes_to_add == 3
+    assert d.target_size == 7
