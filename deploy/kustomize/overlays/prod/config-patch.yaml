@@ -39,38 +39,26 @@ data:
       pending_pod_threshold: 0
       headroom: 0.10
       max_size: 45
-      # Capacity accounting caveat, unchanged from when this file was written:
-      # the scaler only measures nodes labelled
-      # yandex.cloud/node-group-id=<node_group_id>, but bot-prod pods select on
-      # workload=general-prod, which ALSO matches worker-prod-reserve. Free
-      # capacity on the reserve is therefore invisible here and the scaler can
-      # add a node the reserve would have absorbed. The reserve is one node now
-      # (15 worker slots) and runs full through the peak, so the overlap is
-      # small - but it is the first thing to check if scale-up looks eager.
+      # min_size 2, and the number is load-bearing. worker-prod-reserve was
+      # removed on 2026-09-12, so this group alone is the off-peak floor. A
+      # worker takes 2 CPU and one squat.ai/video device and 15 fit on a
+      # 32-core node, so 2 nodes = 30 slots - the floor the old 1 reserve +
+      # 1 burst gave. Over the 14 days to 2026-08-31 the off-peak queue ran
+      # p99 21 on weeknights (5 warm + 21 = 26 of 30 slots); only the outlier
+      # night (max 36 queued) reaches for a third node. 1 would leave 15 slots
+      # and make p99 spikes wait out a scale-up: ~40s to decide, ~2 min for
+      # the node, ~2 more before the device plugin advertises squat.ai/video.
       #
-      # min_size 1, and the number is load-bearing: with worker-prod-reserve
-      # fixed at one node (15 worker slots) this is what the cluster costs when
-      # nothing is happening.
-      #
-      # 2 was wrong. A pool of 35 needs three nodes and a pool of 5 needs one,
-      # so a floor of 1 reserve + 2 burst is three nodes around the clock - the
-      # same three the peak needs. The schedule would have dropped the pool
-      # every night and saved nothing.
-      #
-      # 0 is wrong too, in the other direction. Measured over the 14 days to
-      # 2026-08-31, the off-peak queue runs p99 21 on weeknights and 18 at
-      # weekends, so 5 + 21 = 26 slots are wanted at the 99th percentile and the
-      # reserve alone offers 15. On 0 those spikes would wait out a scale-up:
-      # ~40s to decide, ~2 min for the node, ~2 more before the device plugin
-      # advertises squat.ai/video - five minutes before a meeting gets a bot.
-      #
-      # 1 covers p99 (26 of 30 slots) and only the outlier night - the 14-day
-      # max was 36 queued - reaches for a third node.
+      # bot-prod-main, calendar-prod-app and scheduler-prod-app tolerate
+      # dedicated=bots and run on this group too. The empty-node check only
+      # sees app=bot-prod-worker, so a scale-down can pick a node that carries
+      # one of them (Yandex chooses which node goes) - expect a short restart.
       #
       # What min_size does NOT do: grow the group. It is a floor for scale-down
       # only (app/scaling.py: target = max(current_size - empty, min_size));
-      # scale-up is driven purely by Pending pods.
-      min_size: 1
+      # scale-up is driven purely by Pending pods. After raising it, resize the
+      # group to the floor by hand once.
+      min_size: 2
       scale_down_cooldown_polls: 3
       poll_interval_seconds: 30
       # Live, not a dry run: prod capacity has to actually follow the load.

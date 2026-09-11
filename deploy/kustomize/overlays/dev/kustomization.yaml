@@ -15,4 +15,4 @@ patches:
 
 images:
   - name: cr.yandex/crpcvsde88m85as3hdu0/lite-scaler
-    newTag: latest
+    newTag: "1f81ade"
