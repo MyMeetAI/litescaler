@@ -29,4 +29,4 @@ images:
     # The build dev has been running since 2026-08-20. Prod pins an immutable
     # tag on purpose: a rolling restart must bring back the build that was
     # watched, not whatever was pushed to :latest since.
-    newTag: "1f81ade"
+    newTag: "3fd9049"
