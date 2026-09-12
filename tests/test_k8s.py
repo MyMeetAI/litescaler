@@ -352,3 +352,15 @@ def test_get_node_capacity_skips_nodes_reporting_no_allocatable():
         4000, 8 * 1024**3
     )
     assert _kube_with([zero], []).get_node_capacity("grp-1") is None
+
+
+def test_occupied_node_names_ignores_finished_pods():
+    def pod(node, phase):
+        return SimpleNamespace(
+            spec=SimpleNamespace(node_name=node),
+            metadata=SimpleNamespace(labels={"team": "ml"}),
+            status=SimpleNamespace(phase=phase),
+        )
+
+    pods = [pod("a", "Running"), pod("b", "Succeeded"), pod("c", "Failed"), pod("d", "Pending")]
+    assert occupied_node_names(pods, ["team=ml"]) == {"a", "d"}

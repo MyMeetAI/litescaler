@@ -97,8 +97,13 @@ def occupied_node_names(pods, selectors) -> set:
     occupied = set()
     for pod in pods:
         node_name = getattr(pod.spec, "node_name", None)
-        if node_name and pod_matches_selectors(pod, selectors):
-            occupied.add(node_name)
+        if not node_name or not pod_matches_selectors(pod, selectors):
+            continue
+        # Finished pods - e.g. the Job history KEDA keeps - hold no resources and
+        # must not pin a node as busy, or the group can never shrink past them.
+        if getattr(getattr(pod, "status", None), "phase", None) in ("Succeeded", "Failed"):
+            continue
+        occupied.add(node_name)
     return occupied
 
 
