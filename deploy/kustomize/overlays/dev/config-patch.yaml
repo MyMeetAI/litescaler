@@ -42,7 +42,17 @@ data:
       # to spare - so an eviction reschedules rather than strands them. The old
       # floor cost real money: 609 of 1123 worker-dev node-hours over 14 days
       # (54%) carried no worker job at all, ~21k RUB/month for nothing.
-      min_size: 1
+      #
+      # 1 -> 2 on 2026-09-12. worker-prod-reserve is gone, so this group is the
+      # only untainted one left, and Yandex's reconciled addons - which carry no
+      # nodeSelector and tolerate only CriticalAddonsOnly - now live here:
+      # coredns (2 replicas, topologySpread by hostname with DoNotSchedule),
+      # metrics-server (2) and kube-dns-autoscaler. On a single node the second
+      # coredns replica has nowhere to go and stays Pending, leaving the whole
+      # cluster on one DNS pod. Two nodes keep two hosts; one extra dev node is
+      # ~16 RUB/h (10 nodes = 162 RUB/h above). Lower it again only once the
+      # addons have a home of their own.
+      min_size: 2
       scale_down_cooldown_polls: 3
       poll_interval_seconds: 30
       # Live on dev. Toggling this no longer needs a pod restart: the
