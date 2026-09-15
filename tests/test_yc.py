@@ -13,6 +13,17 @@ def _yc():
     return yc
 
 
+def test_get_current_size_sets_a_request_deadline():
+    yc = _yc()
+    yc._svc.Get.return_value = SimpleNamespace(
+        scale_policy=SimpleNamespace(fixed_scale=SimpleNamespace(size=2))
+    )
+
+    yc.get_current_size()
+
+    assert yc._svc.Get.call_args.kwargs.get("timeout")
+
+
 def test_set_size_records_operation_id():
     yc = _yc()
     yc._svc.Update.return_value = SimpleNamespace(id="op-123")

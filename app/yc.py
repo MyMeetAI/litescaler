@@ -57,7 +57,7 @@ class YcClient:
     def get_current_size(self) -> int:
         with _counting_errors("get_size"):
             group = self._svc.Get(
-                GetNodeGroupRequest(node_group_id=self._node_group_id)
+                GetNodeGroupRequest(node_group_id=self._node_group_id), timeout=30
             )
         return int(group.scale_policy.fixed_scale.size)
 
