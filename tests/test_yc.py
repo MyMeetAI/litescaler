@@ -13,6 +13,17 @@ def _yc():
     return yc
 
 
+def test_get_current_size_sets_a_request_deadline():
+    yc = _yc()
+    yc._svc.Get.return_value = SimpleNamespace(
+        scale_policy=SimpleNamespace(fixed_scale=SimpleNamespace(size=2))
+    )
+
+    yc.get_current_size()
+
+    assert yc._svc.Get.call_args.kwargs.get("timeout")
+
+
 def test_set_size_records_operation_id():
     yc = _yc()
     yc._svc.Update.return_value = SimpleNamespace(id="op-123")
@@ -46,6 +57,25 @@ def test_operation_in_progress_clears_when_done():
     yc._ops.Get.reset_mock()
     assert yc.operation_in_progress() is False
     yc._ops.Get.assert_not_called()
+
+
+def test_set_size_sets_a_request_deadline():
+    yc = _yc()
+    yc._svc.Update.return_value = SimpleNamespace(id="op-123")
+
+    yc.set_size(3)
+
+    assert yc._svc.Update.call_args.kwargs.get("timeout")
+
+
+def test_operation_in_progress_sets_a_request_deadline():
+    yc = _yc()
+    yc._last_operation_id = "op-123"
+    yc._ops.Get.return_value = SimpleNamespace(done=False)
+
+    yc.operation_in_progress()
+
+    assert yc._ops.Get.call_args.kwargs.get("timeout")
 
 
 def _creds():
@@ -88,6 +118,27 @@ def test_capture_connection_picks_external_endpoint():
     c._capture_connection(MagicMock(Get=MagicMock(return_value=cluster)), "external")
     assert c.endpoint == "https://203.0.113.1:443"
     assert c.ca_cert == "CA-PEM"
+
+
+def test_capture_connection_sets_a_request_deadline():
+    c = _creds()
+    cluster_svc = MagicMock(
+        Get=MagicMock(return_value=_cluster("https://10.0.0.1:443", "", "CA-PEM"))
+    )
+
+    c._capture_connection(cluster_svc, "internal")
+
+    assert cluster_svc.Get.call_args.kwargs.get("timeout")
+
+
+def test_mint_token_sets_a_request_deadline(monkeypatch):
+    monkeypatch.setattr("app.yc.jwt.encode", lambda *a, **k: "signed-jwt")
+    c = _creds()
+    c._iam.Create.return_value = _iam_response("tok-1", 12 * 3600)
+
+    c.get_token()
+
+    assert c._iam.Create.call_args.kwargs.get("timeout")
 
 
 def _iam_response(token, expires_at_seconds):

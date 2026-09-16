@@ -57,7 +57,7 @@ class YcClient:
     def get_current_size(self) -> int:
         with _counting_errors("get_size"):
             group = self._svc.Get(
-                GetNodeGroupRequest(node_group_id=self._node_group_id)
+                GetNodeGroupRequest(node_group_id=self._node_group_id), timeout=30
             )
         return int(group.scale_policy.fixed_scale.size)
 
@@ -70,7 +70,7 @@ class YcClient:
             ),
         )
         with _counting_errors("update"):
-            operation = self._svc.Update(request)
+            operation = self._svc.Update(request, timeout=30)
         self._last_operation_id = getattr(operation, "id", None) or None
         logger.info(
             "Requested node-group %s resize to %d (operation %s)",
@@ -82,7 +82,8 @@ class YcClient:
             return False
         with _counting_errors("get_operation"):
             operation = self._ops.Get(
-                GetOperationRequest(operation_id=self._last_operation_id)
+                GetOperationRequest(operation_id=self._last_operation_id),
+                timeout=30,
             )
         if getattr(operation, "done", False):
             self._last_operation_id = None
@@ -106,7 +107,9 @@ class YcKubeCredentials:
         self._capture_connection(sdk.client(ClusterServiceStub), endpoint_type)
 
     def _capture_connection(self, cluster_svc, endpoint_type: str) -> None:
-        cluster = cluster_svc.Get(GetClusterRequest(cluster_id=self._cluster_id))
+        cluster = cluster_svc.Get(
+            GetClusterRequest(cluster_id=self._cluster_id), timeout=30
+        )
         endpoints = cluster.master.endpoints
         if endpoint_type == "internal":
             self.endpoint = endpoints.internal_v4_endpoint
@@ -140,7 +143,7 @@ class YcKubeCredentials:
             headers={"kid": self._sa_key["id"]},
         )
         with _counting_errors("iam_token"):
-            response = self._iam.Create(CreateIamTokenRequest(jwt=signed))
+            response = self._iam.Create(CreateIamTokenRequest(jwt=signed), timeout=30)
         metrics.record_iam_token_mint()
         self._token = response.iam_token
         expires_at = response.expires_at
